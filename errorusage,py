@@ -1,0 +1,174 @@
+import datetime
+import numpy as np
+import pandas as pd
+import ccxt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+
+def fetch_binance_data(symbol, start_date, end_date, timeframe='1h'):
+    exchange = ccxt.binance()
+    since = exchange.parse8601(start_date)
+    now = exchange.parse8601(end_date)
+    
+    all_data = []
+    while since < now:
+        data = exchange.fetch_ohlcv(symbol, timeframe, since)
+        if not data:
+            break
+        all_data.extend(data)
+        since = data[-1][0] + 1
+        
+    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df
+
+def preprocess_data(df):
+    df = df[['close']].copy()
+    df['close'] = df['close'].astype(float)
+    return df
+
+def prepare_data(df, window_size):
+    data = df.values
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data)
+    
+    x = []
+    y = []
+    for i in range(len(data) - window_size):
+        x.append(scaled_data[i:i + window_size])
+        y.append(scaled_data[i + window_size])
+    
+    return np.array(x), np.array(y), scaler
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, x, y):
+        self.x = x.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_layer_size=32, num_layers=2, output_size=1, dropout=0.4):
+        super(LSTMModel, self).__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+        
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        out = self.linear(lstm_out[:, -1, :])
+        return out
+
+def run_epoch(dataloader, model, optimizer, criterion, is_training=False):
+    epoch_loss = 0
+    if is_training:
+        model.train()
+    else:
+        model.eval()
+
+    for x, y in dataloader:
+        if is_training:
+            optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        if is_training:
+            loss.backward()
+            optimizer.step()
+        epoch_loss += loss.item()
+
+    return epoch_loss / len(dataloader)
+
+def simulate_trading(start_date, end_date, symbol, window_size=20, epochs=10, initial_capital=10000, trade_freq=1):
+    df = fetch_binance_data(symbol, start_date, end_date)
+    df = preprocess_data(df)
+    x, y, scaler = prepare_data(df, window_size)
+
+    split_idx = int(len(x) * 0.8)
+    x_train, x_val = x[:split_idx], x[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+    
+    train_dataset = TimeSeriesDataset(x_train, y_train)
+    val_dataset = TimeSeriesDataset(x_val, y_val)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+    model = LSTMModel(input_size=x_train.shape[2])
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(epochs):
+        train_loss = run_epoch(train_loader, model, optimizer, criterion, is_training=True)
+        val_loss = run_epoch(val_loader, model, optimizer, criterion)
+        print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    
+    model.eval()
+    with torch.no_grad():
+        predictions = []
+        for x_batch, _ in val_loader:
+            out = model(x_batch)
+            predictions.append(out.numpy())
+        predictions = np.concatenate(predictions, axis=0)
+    
+    predicted_prices = scaler.inverse_transform(predictions)
+    actual_prices = scaler.inverse_transform(y_val)
+    
+    capital = initial_capital
+    position = 0
+    trade_history = []
+    
+    for i in range(1, len(predicted_prices)):
+        current_price = df.iloc[i + window_size].close
+        
+        if i % trade_freq == 0:
+            if predicted_prices[i] > predicted_prices[i - 1] and capital > 0:
+                position = capital / current_price
+                capital = 0
+                trade_history.append((df.index[i + window_size], 'BUY', current_price, position))
+            elif predicted_prices[i] < predicted_prices[i - 1] and position > 0:
+                capital = position * current_price
+                position = 0
+                trade_history.append((df.index[i + window_size], 'SELL', current_price, capital))
+    
+    if position > 0:
+        capital = position * df.iloc[-1].close
+        trade_history.append((df.index[-1], 'SELL', df.iloc[-1].close, capital))
+    
+    profit = capital - initial_capital
+
+    plt.figure(figsize=(14, 7))
+    plt.plot(df.index, df['close'], label='Actual Prices', color='blue')
+    
+    predicted_dates = df.index[window_size:len(predicted_prices) + window_size]
+    plt.plot(predicted_dates, predicted_prices, label='Predicted Prices', color='orange')
+    
+    trades = pd.DataFrame(trade_history, columns=['Date', 'Action', 'Price', 'Value'])
+    buy_signals = trades[trades['Action'] == 'BUY']
+    sell_signals = trades[trades['Action'] == 'SELL']
+    
+    plt.scatter(buy_signals['Date'], buy_signals['Price'], marker='^', color='green', label='Buy Signal', s=100)
+    plt.scatter(sell_signals['Date'], sell_signals['Price'], marker='v', color='red', label='Sell Signal', s=100)
+    
+    plt.title(f'{symbol} Trading Simulation')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    print(f'Initial Capital: ${initial_capital:.2f}')
+    print(f'Final Capital: ${capital:.2f}')
+    print(f'Profit: ${profit:.2f}')
+    
+    print("\nTrade Logs:")
+    for trade in trade_history:
+        date, action, price, value = trade
+        print(f"Date: {date}, Act
